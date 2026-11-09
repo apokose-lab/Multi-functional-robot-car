@@ -3,43 +3,54 @@
 
 #pragma pack(push, 1)
 
-// 1. Gói tin điều khiển: ESP32-S3 -> Motion 2350 Pro (Qua UART)
+// 1. Gói tin từ Laptop -> ESP32-S3 (Qua Wi-Fi UDP hoặc USB Serial)
+struct JoyPacket {
+    int16_t vx;          // -255 đến 255
+    int16_t vy;          // -255 đến 255
+    int16_t omega;       // -255 đến 255
+    uint8_t buzzer;      // 1 = Kêu còi
+    uint8_t pid_enable;  // 1 = Chạy PID khoá vận tốc RPM, 0 = Chạy PWM trực tiếp
+};
+
+// 2. Gói tin điều khiển: ESP32-S3 -> Motion 2350 Pro (Qua UART)
 struct ControlPacket {
     uint8_t header1 = 0xAA;
     uint8_t header2 = 0x55;
-    int16_t motor_pwm[4];    // PWM mục tiêu cho 4 bánh: FL, FR, RL, RR (-255 đến 255)
-    uint8_t buzzer_cmd = 0;  // 1 = Kêu còi, 0 = Tắt
+    uint8_t pid_enable = 0;  // 1 = PID Mode, 0 = Direct PWM Mode
+    int16_t target_val[4];   // Nếu pid_enable=1: Target RPM | Nếu pid_enable=0: Target PWM (-255..255)
+    uint8_t buzzer_cmd = 0;
     uint8_t checksum;
 };
 
-// 2. Gói tin phản hồi: Motion 2350 Pro -> ESP32-S3 (Qua UART)
+// 3. Gói tin phản hồi: Motion 2350 Pro -> ESP32-S3 (Qua UART)
 struct MotionFeedbackPacket {
     uint8_t header1 = 0xBB;
     uint8_t header2 = 0x66;
-    int16_t actual_pwm[4];   // PWM thực tế đang xuất ra 4 động cơ
-    int16_t actual_rpm[4];   // Tốc độ vòng/phút từ 4 Encoder (sẵn sàng cho PID)
-    uint32_t uptime_ms;      // Thời gian chạy của Motion 2350 Pro
+    int16_t actual_pwm[4];   // Giá trị PWM thực tế đang cấp cho 4 cầu H (-255..255)
+    int16_t actual_rpm[4];   // Tốc độ vòng/phút (RPM) đọc từ 4 PIO Encoder
+    uint32_t uptime_ms;
     uint8_t checksum;
 };
 
-// 3. Gói tin Telemetry không dây: ESP32-S3 -> Laptop (Qua Wi-Fi UDP)
+// 4. Gói tin Telemetry tổng hợp: ESP32-S3 -> Laptop (45 bytes)
 struct WifiTelemetryPacket {
     uint8_t header1 = 0xCC;
     uint8_t header2 = 0x77;
-    int16_t vx;              // Vận tốc tiến/lùi (-255 đến 255)
-    int16_t vy;              // Vận tốc trượt ngang (-255 đến 255)
-    int16_t omega;           // Vận tốc xoay (-255 đến 255)
-    int16_t actual_pwm[4];   // PWM thực tế xác nhận từ Motion 2350 Pro
-    int16_t actual_rpm[4];   // Tốc độ RPM thực tế của 4 bánh
-    int8_t  wifi_rssi;       // Cường độ sóng Wi-Fi (dBm)
-    uint8_t motion_alive;    // 1 = Kết nối UART với Motion 2350 tốt, 0 = Mất kết nối
-    uint32_t uptime_ms;      // Thời gian hoạt động của hệ thống (ms)
+    uint8_t pid_mode;        // Trạng thái PID (1 = Bật, 0 = Tắt)
+    int16_t vx;
+    int16_t vy;
+    int16_t omega;
+    int16_t target_val[4];   // Giá trị mục tiêu của 4 bánh
+    int16_t actual_pwm[4];   // PWM thực tế của 4 bánh
+    int16_t actual_rpm[4];   // RPM thực tế từ 4 Encoder
+    uint16_t us_cm[3];       // Khoảng cách 3 cảm biến SR-04: [0]=Trước, [1]=Trái, [2]=Phải (cm)
+    uint8_t motion_alive;    // 1 = UART OK, 0 = Mất kết nối UART
+    uint32_t uptime_ms;
     uint8_t checksum;
 };
 
 #pragma pack(pop)
 
-// Hàm tính Checksum XOR dùng chung cho mọi loại gói tin
 template <typename T>
 inline uint8_t calculateChecksum(const T& pkt) {
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&pkt);
