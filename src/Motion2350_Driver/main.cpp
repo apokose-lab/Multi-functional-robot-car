@@ -1,20 +1,20 @@
 #include <Arduino.h>
 #include <RobotProtocol.h>
 
-// Định nghĩa chân 4 Cầu H tích hợp trên Cytron Motion 2350 Pro
 const uint8_t M_PINS[4][2] = {
-    {14, 15},   // Motor 1: Front-Left  (M1A = GP8,  M1B = GP9)
-    {12, 13}, // Motor 2: Front-Right (M2A = GP10, M2B = GP11)
-    {10, 11}, // Motor 3: Rear-Left   (M3A = GP12, M3B = GP13)
-    {8, 9}  // Motor 4: Rear-Right  (M4A = GP14, M4B = GP15)
+    {8, 9},   // Motor 1: Front-Left  (M1A = GP8,  M1B = GP9)
+    {10, 11}, // Motor 2: Front-Right (M2A = GP10, M2B = GP11)
+    {12, 13}, // Motor 3: Rear-Left   (M3A = GP12, M3B = GP13)
+    {14, 15}  // Motor 4: Rear-Right  (M4A = GP14, M4B = GP15)
 };
 
-const uint8_t BUZZER_PIN = 22; // Buzzer tích hợp sẵn trên Motion 2350 Pro
+const uint8_t BUZZER_PIN = 22;
 unsigned long lastPacketTime = 0;
+int16_t applied_pwm[4] = {0, 0, 0, 0};
 
-// Hàm điều khiển 1 động cơ với giá trị PWM từ -255 đến +255
 void setMotor(uint8_t index, int16_t pwm) {
     pwm = constrain(pwm, -255, 255);
+    applied_pwm[index] = pwm; // Lưu lại giá trị thực tế đang cấp ra cầu H
     if (pwm > 0) {
         analogWrite(M_PINS[index][0], pwm);
         analogWrite(M_PINS[index][1], 0);
@@ -34,8 +34,7 @@ void stopAllMotors() {
 void setup() {
     Serial.begin(115200);
 
-    // Cấu hình chân PWM cho 4 động cơ
-    analogWriteFreq(20000); // Tần số 20kHz giúp động cơ chạy êm
+    analogWriteFreq(20000);
     analogWriteRange(255);
     for (int i = 0; i < 4; i++) {
         pinMode(M_PINS[i][0], OUTPUT);
@@ -43,23 +42,22 @@ void setup() {
     }
     stopAllMotors();
 
-    // Cấu hình Buzzer báo khởi động (kêu 2 tiếng bíp ngắn)
     pinMode(BUZZER_PIN, OUTPUT);
     tone(BUZZER_PIN, 2000, 100);
     delay(150);
     tone(BUZZER_PIN, 2500, 100);
 
-    // Cấu hình UART0 tại chân GP16 (TX) và GP17 (RX) để nhận lệnh từ ESP32-S3
+    // UART0: GP16 (TX) nối sang RX của ESP32-S3 | GP17 (RX) nối sang TX của ESP32-S3
     Serial1.setTX(16);
     Serial1.setRX(17);
     Serial1.begin(115200);
 }
 
 void loop() {
-    // Kiểm tra và đọc gói tin UART từ ESP32-S3
+    // 1. Nhận lệnh điều khiển từ ESP32-S3
     while (Serial1.available() >= (int)sizeof(ControlPacket)) {
         if (Serial1.peek() != 0xAA) {
-            Serial1.read(); // Bỏ qua byte rác nếu lệch khung truyền
+            Serial1.read();
             continue;
         }
 
@@ -68,21 +66,32 @@ void loop() {
 
         if (pkt.header1 == 0xAA && pkt.header2 == 0x55 && pkt.checksum == calculateChecksum(pkt)) {
             lastPacketTime = millis();
-
-            // Xuất PWM ra 4 động cơ
             for (int i = 0; i < 4; i++) {
                 setMotor(i, pkt.motor_pwm[i]);
             }
-
-            // Điều khiển Buzzer nếu có lệnh
             if (pkt.buzzer_cmd == 1) {
                 tone(BUZZER_PIN, 1800, 80);
             }
         }
     }
 
-    // Cơ chế an toàn (Watchdog): Tự dừng xe nếu mất kết nối UART quá 300ms
+    // 2. Watchdog an toàn: Tự ngắt nếu mất tín hiệu từ ESP32-S3 quá 300ms
     if (millis() - lastPacketTime > 300) {
         stopAllMotors();
+    }
+
+    // 3. Gửi gói tin phản hồi (Feedback) ngược lên ESP32-S3 mỗi 40ms (25Hz)
+    static unsigned long lastFeedback = 0;
+    if (millis() - lastFeedback >= 40) {
+        lastFeedback = millis();
+        MotionFeedbackPacket fb;
+        for (int i = 0; i < 4; i++) {
+            fb.actual_pwm[i] = applied_pwm[i];
+            fb.actual_rpm[i] = 0; // Sẽ gán giá trị từ PIO Encoder ở bước lắp PID
+        }
+        fb.uptime_ms = millis();
+        fb.checksum  = calculateChecksum(fb);
+
+        Serial1.write(reinterpret_cast<const uint8_t*>(&fb), sizeof(MotionFeedbackPacket));
     }
 }
