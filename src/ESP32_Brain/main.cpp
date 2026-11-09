@@ -28,21 +28,22 @@ struct JoyPacket {
     uint8_t buzzer;  // Nút bấm còi
 };
 #pragma pack(pop)
+// Khai báo thêm mảng lưu trạng thái PWM toàn cục (đặt phía trên hàm sendToMotion2350)
+int16_t current_pwm[4] = {0, 0, 0, 0};
 
 void sendToMotion2350(int16_t vx, int16_t vy, int16_t rot, uint8_t buzz) {
-    // Công thức trộn động học ngược (Inverse Kinematics) cho 4 bánh Mecanum
-    int16_t fl = vx - vy - rot; // Bánh Trái Trước (M1)
-    int16_t fr = vx + vy + rot; // Bánh Phải Trước (M2)
-    int16_t rl = vx + vy - rot; // Bánh Trái Sau   (M3)
-    int16_t rr = vx - vy + rot; // Bánh Phải Sau   (M4)
+    // Công thức trộn động học ngược cho 4 bánh Mecanum
+    current_pwm[0] = constrain(vx - vy - rot, -255, 255); // M1: Front-Left
+    current_pwm[1] = constrain(vx + vy + rot, -255, 255); // M2: Front-Right
+    current_pwm[2] = constrain(vx + vy - rot, -255, 255); // M3: Rear-Left
+    current_pwm[3] = constrain(vx - vy + rot, -255, 255); // M4: Rear-Right
 
     ControlPacket pkt;
-    pkt.motor_pwm[0] = constrain(fl, -255, 255);
-    pkt.motor_pwm[1] = constrain(fr, -255, 255);
-    pkt.motor_pwm[2] = constrain(rl, -255, 255);
-    pkt.motor_pwm[3] = constrain(rr, -255, 255);
-    pkt.buzzer_cmd   = buzz;
-    pkt.checksum     = calculateChecksum(pkt);
+    for (int i = 0; i < 4; i++) {
+        pkt.motor_pwm[i] = current_pwm[i];
+    }
+    pkt.buzzer_cmd = buzz;
+    pkt.checksum   = calculateChecksum(pkt);
 
     MotionSerial.write(reinterpret_cast<const uint8_t*>(&pkt), sizeof(ControlPacket));
 }
@@ -80,7 +81,7 @@ void loop() {
         JoyPacket joy;
         udp.read(reinterpret_cast<uint8_t*>(&joy), sizeof(JoyPacket));
         vx = joy.vx;
-        vy = joy.vy;z
+        vy = joy.vy;
         omega = joy.omega;
         buzzer = joy.buzzer;
         lastInputTime = millis();
@@ -111,10 +112,12 @@ void loop() {
         lastSend = millis();
         sendToMotion2350(vx, vy, omega, buzzer);
     }
-    // Thêm vào cuối hàm loop() của src/esp32_brain/main.cpp
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint >= 1000) {
-      lastPrint = millis();
-      Serial.printf("[ESP32-S3] Dang chay! Vx=%d, Vy=%d, Omega=%d\n", vx, vy, omega);
-  }
+    // 4. In chi tiết PWM từng bánh mỗi 200ms lên Serial Monitor
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint >= 200) {
+        lastPrint = millis();
+        Serial.printf("In[Vx:%4d Vy:%4d W:%4d] -> PWM[ M1_FL:%4d | M2_FR:%4d | M3_RL:%4d | M4_RR:%4d ]\n",
+                      vx, vy, omega,
+                      current_pwm[0], current_pwm[1], current_pwm[2], current_pwm[3]);
+    }
 }
