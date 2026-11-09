@@ -8,7 +8,7 @@ import pygame
 import serial
 import serial.tools.list_ports
 
-# 1. Auto-detect ESP32-S3 USB Serial port (if connected via cable)
+# 1. Auto-detect ESP32-S3 USB Serial port
 ser = None
 for port in serial.tools.list_ports.comports():
     if port.vid == 0x303A or "USB JTAG" in port.description or "CH340" in port.description or "CP210" in port.description:
@@ -21,7 +21,7 @@ for port in serial.tools.list_ports.comports():
         except Exception:
             pass
 
-# 2. Configure Non-blocking Wi-Fi UDP socket
+# 2. Non-blocking Wi-Fi UDP socket
 UDP_IP = "192.168.4.1"
 UDP_PORT = 4210
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -30,7 +30,6 @@ sock.setblocking(False)
 pygame.init()
 pygame.joystick.init()
 
-# Resizable HD Dashboard Window (1280x760)
 screen = pygame.display.set_mode((1280, 760), pygame.RESIZABLE)
 pygame.display.set_caption("Mecanum Robot - PID & Ultrasonic Telemetry Dashboard")
 
@@ -41,16 +40,15 @@ font_small = pygame.font.SysFont("Consolas", 15, bold=True)
 
 MAX_PWM = 220
 DEADZONE = 0.12
-pid_enable = 0       # 0 = Open-Loop Direct PWM, 1 = Closed-Loop PID (RPM)
+pid_enable = 0
 prev_y_btn = False
 
-# Telemetry state variables
 rx_pid_mode = 0
 rx_vx, rx_vy, rx_omega = 0, 0, 0
 rx_target = [0, 0, 0, 0]
 rx_pwm    = [0, 0, 0, 0]
 rx_rpm    = [0, 0, 0, 0]
-rx_us     = [200, 200, 200] # [0]=Front, [1]=Left, [2]=Right (cm)
+rx_us     = [200, 200, 200]
 rx_motion_alive = 0
 rx_uptime = 0
 last_rx_time = 0.0
@@ -63,7 +61,9 @@ serial_buf = bytearray()
 def apply_deadzone(val):
     return 0.0 if abs(val) < DEADZONE else val
 
-def get_direction_label(vx, vy, omega):
+def get_direction_label(vx, vy, omega, test_w):
+    if test_w > 0:
+        return f"CALIBRATING MOTOR M{test_w} (+150 PWM)"
     if abs(vx) < 10 and abs(vy) < 10 and abs(omega) < 10:
         return "IDLE (STOPPED)"
     if abs(omega) >= max(abs(vx), abs(vy)):
@@ -82,9 +82,10 @@ def draw_badge(surf, x, y, w, h, text, bg_color):
     txt = font_small.render(text, True, (255, 255, 255))
     surf.blit(txt, (x + (w - txt.get_width()) // 2, y + (h - txt.get_height()) // 2))
 
-def draw_dual_bar(surf, x, y, w, h, title, target_v, rpm_v, pwm_v, is_pid):
+def draw_dual_bar(surf, x, y, w, h, title, target_v, rpm_v, pwm_v, is_pid, highlight):
+    border_col = (241, 196, 15) if highlight else (55, 65, 82)
     pygame.draw.rect(surf, (33, 39, 50), (x, y, w, h), border_radius=10)
-    pygame.draw.rect(surf, (55, 65, 82), (x, y, w, h), 2, border_radius=10)
+    pygame.draw.rect(surf, border_col, (x, y, w, h), 3 if highlight else 2, border_radius=10)
 
     unit_str = "RPM" if is_pid else "PWM"
     header_str = f"{title}   |   Target: {target_v:4d} {unit_str}   |   Encoder: {rpm_v:4d} RPM   |   Out: {pwm_v:4d} PWM"
@@ -94,7 +95,7 @@ def draw_dual_bar(surf, x, y, w, h, title, target_v, rpm_v, pwm_v, is_pid):
     bar_w = w - 32
     mid_x = bar_x + bar_w // 2
 
-    # Bar 1: Actual Wheel Speed from Encoder (RPM - Max scale 150 RPM)
+    # Bar 1: Encoder RPM
     y_rpm = y + 42
     pygame.draw.rect(surf, (22, 26, 34), (bar_x, y_rpm, bar_w, 22), border_radius=5)
     rpm_ratio = max(-1.0, min(1.0, rpm_v / 150.0))
@@ -106,7 +107,7 @@ def draw_dual_bar(surf, x, y, w, h, title, target_v, rpm_v, pwm_v, is_pid):
     pygame.draw.line(surf, (140, 150, 165), (mid_x, y_rpm), (mid_x, y_rpm + 22), 2)
     surf.blit(font_small.render("ENCODER (RPM)", True, (170, 185, 205)), (bar_x + 8, y_rpm + 2))
 
-    # Bar 2: Applied Motor H-Bridge Duty Cycle (PWM -255 to 255)
+    # Bar 2: Motor PWM
     y_pwm = y + 70
     pygame.draw.rect(surf, (22, 26, 34), (bar_x, y_pwm, bar_w, 22), border_radius=5)
     pwm_ratio = max(-1.0, min(1.0, pwm_v / 255.0))
@@ -119,9 +120,9 @@ def draw_dual_bar(surf, x, y, w, h, title, target_v, rpm_v, pwm_v, is_pid):
     surf.blit(font_small.render("MOTOR (PWM)", True, (170, 185, 205)), (bar_x + 8, y_pwm + 2))
 
 def us_color(cm):
-    if cm < 20: return (231, 76, 60)    # Red: Danger (< 20cm)
-    if cm < 45: return (241, 196, 15)   # Yellow: Warning (20 - 45cm)
-    return (46, 204, 113)               # Green: Safe (> 45cm)
+    if cm < 20: return (231, 76, 60)
+    if cm < 45: return (241, 196, 15)
+    return (46, 204, 113)
 
 def parse_telemetry_bytes(data, source_name):
     global rx_pid_mode, rx_vx, rx_vy, rx_omega, rx_target, rx_pwm, rx_rpm, rx_us
@@ -145,6 +146,16 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_p:
+            pid_enable = 1 - pid_enable
+
+    # Check keyboard keys 1, 2, 3, 4 for single-wheel calibration
+    keys = pygame.key.get_pressed()
+    test_wheel = 0
+    if keys[pygame.K_1]: test_wheel = 1
+    elif keys[pygame.K_2]: test_wheel = 2
+    elif keys[pygame.K_3]: test_wheel = 3
+    elif keys[pygame.K_4]: test_wheel = 4
 
     js = pygame.joystick.Joystick(0) if pygame.joystick.get_count() > 0 else None
     if js:
@@ -156,11 +167,10 @@ while running:
         vy = int(raw_vy * MAX_PWM)
         omega = int(raw_omega * MAX_PWM)
 
-        if js.get_button(0): # Cross (X) / A Button: Emergency Stop
+        if js.get_button(0):
             vx, vy, omega = 0, 0, 0
-        buzzer = 1 if js.get_button(1) else 0 # Circle (O) / B Button: Buzzer
+        buzzer = 1 if js.get_button(1) else 0
 
-        # Triangle / Y Button (Button 3): Toggle between Direct PWM and PID Mode
         y_btn = bool(js.get_button(3)) if js.get_numbuttons() > 3 else False
         if y_btn and not prev_y_btn:
             pid_enable = 1 - pid_enable
@@ -168,14 +178,14 @@ while running:
     else:
         vx, vy, omega, buzzer = 0, 0, 0, 0
 
-    # 1. Send Control Packet via both USB Serial and Wi-Fi UDP
+    # 1. Send Control Packet (9 bytes)
     if ser and ser.is_open:
         try:
-            ser.write(struct.pack('<BhhhBB', 0xFE, vx, vy, omega, buzzer, pid_enable))
+            ser.write(struct.pack('<BhhhBBB', 0xFE, vx, vy, omega, buzzer, pid_enable, test_wheel))
         except Exception:
             pass
     try:
-        sock.sendto(struct.pack('<hhhBB', vx, vy, omega, buzzer, pid_enable), (UDP_IP, UDP_PORT))
+        sock.sendto(struct.pack('<hhhBBB', vx, vy, omega, buzzer, pid_enable, test_wheel), (UDP_IP, UDP_PORT))
     except Exception:
         pass
 
@@ -203,13 +213,12 @@ while running:
         except Exception:
             pass
 
-    is_online = (time.time() - last_rx_time) < 0.6
+    is_online = (time.time() - last_rx_time) < 0.7
 
-    # 3. Render Responsive Dashboard UI
+    # 3. Render Dashboard UI
     W, H = screen.get_size()
     screen.fill((18, 22, 29))
 
-    # --- TOP HEADER BAR ---
     pygame.draw.rect(screen, (26, 32, 44), (0, 0, W, 68))
     screen.blit(font_h1.render("MECANUM ROBOT TELEMETRY & PID DASHBOARD", True, (88, 166, 255)), (24, 18))
 
@@ -223,18 +232,17 @@ while running:
     mode_txt = "MODE: PID (RPM)" if pid_enable else "MODE: DIRECT PWM"
     draw_badge(screen, W - 195, badge_y, 175, 34, mode_txt, (142, 68, 173) if pid_enable else (44, 62, 80))
 
-    # Two-Column Layout: Left (58% width) & Right (42% width)
     left_x = 24
     left_w = int(W * 0.58) - 36
     right_x = left_x + left_w + 24
     right_w = W - right_x - 24
 
-    # --- LEFT COLUMN: KINEMATICS & 4 WHEEL CARDS ---
+    # --- LEFT COLUMN ---
     pygame.draw.rect(screen, (33, 39, 50), (left_x, 86, left_w, 115), border_radius=10)
-    dir_label = get_direction_label(vx, vy, omega)
-    screen.blit(font_h2.render(f"MOTION STATE: {dir_label}", True, (255, 215, 0)), (left_x + 18, 98))
-    screen.blit(font_body.render(f"Gamepad Input ->  Vx (Fwd): {vx:4d}   |   Vy (Strafe): {vy:4d}   |   Omega (Yaw): {omega:4d}", True, (220, 230, 242)), (left_x + 18, 134))
-    screen.blit(font_small.render("Controls: [Cross/A] Brake   |   [Circle/B] Buzzer   |   [Triangle/Y] Toggle PWM / PID Mode", True, (140, 160, 185)), (left_x + 18, 168))
+    dir_label = get_direction_label(vx, vy, omega, test_wheel)
+    screen.blit(font_h2.render(f"MOTION STATE: {dir_label}", True, (255, 215, 0)), (left_x + 18, 96))
+    screen.blit(font_body.render(f"Gamepad -> Vx (Fwd): {vx:4d}  |  Vy (Strafe): {vy:4d}  |  Omega (Yaw): {omega:4d}", True, (220, 230, 242)), (left_x + 18, 132))
+    screen.blit(font_small.render("Hold Keys [1][2][3][4]: Test M1..M4 (+150 PWM) | [Triangle/Key P]: Toggle PID | [Circle]: Buzzer", True, (140, 185, 220)), (left_x + 18, 166))
 
     wheel_titles = [
         "M1 (Front-Left  - FL)",
@@ -248,44 +256,39 @@ while running:
         t_val = rx_target[i] if is_online else 0
         r_val = rx_rpm[i]    if is_online else 0
         p_val = rx_pwm[i]    if is_online else 0
-        draw_dual_bar(screen, left_x, cy, left_w, card_h, wheel_titles[i], t_val, r_val, p_val, bool(pid_enable))
+        draw_dual_bar(screen, left_x, cy, left_w, card_h, wheel_titles[i], t_val, r_val, p_val, bool(pid_enable), test_wheel == (i + 1))
 
-    # --- RIGHT COLUMN: ULTRASONIC PROXIMITY RADAR (3x SR-04) ---
+    # --- RIGHT COLUMN ---
     radar_h = H - 86 - 24
     pygame.draw.rect(screen, (33, 39, 50), (right_x, 86, right_w, radar_h), border_radius=10)
     pygame.draw.rect(screen, (55, 65, 82), (right_x, 86, right_w, radar_h), 2, border_radius=10)
     screen.blit(font_h2.render("ULTRASONIC PROXIMITY RADAR (3x SR-04)", True, (88, 166, 255)), (right_x + 20, 102))
 
-    # Top-down Mecanum Chassis Center
     cx = right_x + right_w // 2
     cy = 86 + radar_h // 2 + 10
     car_w, car_h = 120, 170
 
-    # 1. Front Ultrasonic Sensor Cone (rx_us[0])
     f_col = us_color(rx_us[0])
     pygame.draw.polygon(screen, f_col, [(cx - 25, cy - car_h//2 - 8), (cx + 25, cy - car_h//2 - 8), (cx + 70, cy - car_h//2 - 95), (cx - 70, cy - car_h//2 - 95)], 3)
     draw_badge(screen, cx - 85, cy - car_h//2 - 140, 170, 36, f"FRONT: {rx_us[0]:3d} cm", f_col)
 
-    # 2. Left Ultrasonic Sensor Cone (rx_us[1])
     l_col = us_color(rx_us[1])
     pygame.draw.polygon(screen, l_col, [(cx - car_w//2 - 8, cy - 25), (cx - car_w//2 - 8, cy + 25), (cx - car_w//2 - 85, cy + 65), (cx - car_w//2 - 85, cy - 65)], 3)
     draw_badge(screen, cx - car_w//2 - 190, cy - 18, 150, 36, f"LEFT: {rx_us[1]:3d} cm", l_col)
 
-    # 3. Right Ultrasonic Sensor Cone (rx_us[2])
     r_col = us_color(rx_us[2])
     pygame.draw.polygon(screen, r_col, [(cx + car_w//2 + 8, cy - 25), (cx + car_w//2 + 8, cy + 25), (cx + car_w//2 + 85, cy + 65), (cx + car_w//2 + 85, cy - 65)], 3)
     draw_badge(screen, cx + car_w//2 + 40, cy - 18, 150, 36, f"RIGHT: {rx_us[2]:3d} cm", r_col)
 
-    # Draw Chassis & 4 Active Mecanum Wheels
     pygame.draw.rect(screen, (60, 72, 92), (cx - car_w//2, cy - car_h//2, car_w, car_h), border_radius=14)
     pygame.draw.rect(screen, (140, 160, 190), (cx - car_w//2, cy - car_h//2, car_w, car_h), 3, border_radius=14)
     screen.blit(font_small.render("FRONT", True, (255, 215, 0)), (cx - 24, cy - car_h//2 + 12))
 
     wheel_coords = [
-        (cx - car_w//2 - 22, cy - car_h//2 + 15), # M1 FL
-        (cx + car_w//2 + 4,  cy - car_h//2 + 15), # M2 FR
-        (cx - car_w//2 - 22, cy + car_h//2 - 60), # M3 RL
-        (cx + car_w//2 + 4,  cy + car_h//2 - 60)  # M4 RR
+        (cx - car_w//2 - 22, cy - car_h//2 + 15),
+        (cx + car_w//2 + 4,  cy - car_h//2 + 15),
+        (cx - car_w//2 - 22, cy + car_h//2 - 60),
+        (cx + car_w//2 + 4,  cy + car_h//2 - 60)
     ]
     for i, (wx, wy) in enumerate(wheel_coords):
         w_col = (100, 110, 125)
@@ -293,12 +296,11 @@ while running:
         elif rx_pwm[i] < -10: w_col = (230, 126, 34)
         pygame.draw.rect(screen, w_col, (wx, wy, 18, 45), border_radius=4)
 
-    # Distance Alert Legend at the bottom of the right panel
     legend_y = 86 + radar_h - 42
     screen.blit(font_small.render("Proximity Alert:   [Red < 20cm]     [Yellow 20-45cm]     [Green > 45cm]", True, (180, 195, 215)), (right_x + 24, legend_y))
 
     pygame.display.flip()
-    clock.tick(50)
+    clock.tick(35)
 
 if ser:
     ser.close()
