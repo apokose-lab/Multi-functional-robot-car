@@ -6,4 +6,4 @@ Technical Collaborator: Khoa Dang
 
 The readme file will be updated as developments occur...
 
-![System architecture](./flowcharts/system_architecture.drawio.svg.png)
+![System architecture](flowcharts/system_architecture.drawio.svg.png)
