@@ -7,3 +7,4 @@
 ESP32_Brain/.pio/
 Arduino_Motor/.pio/
 **/.vscode/
+compile_commands.json

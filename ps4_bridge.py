@@ -4,29 +4,29 @@ os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
 import socket
 import struct
 import time
-import pygame
-
-UDP_IP = "192.168.4.1"
-UDP_PORT = 4210
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setblocking(False)
-
-pygame.init()
-pygame.joystick.init()
-
-screen = pygame.display.set_mode((1280, 780), pygame.RESIZABLE)
-pygame.display.set_caption("Mecanum Robot - PID, Encoder & Ultrasonic Diagnostic Dashboard")
-
-font_h1    = pygame.font.SysFont("Segoe UI", 25, bold=True)
-font_h2    = pygame.font.SysFont("Segoe UI", 19, bold=True)
-font_body  = pygame.font.SysFont("Consolas", 17, bold=True)
-font_small = pygame.font.SysFont("Consolas", 14, bold=True)
-
-MAX_PWM = 220
-DEADZONE = 0.12
-pid_enable = 0
-prev_y_btn = False
-
+import pygame 
+ 
+UDP_IP = "192.168.4.1" 
+UDP_PORT = 4210 
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+sock.setblocking(False) 
+ 
+pygame.init() 
+pygame.joystick.init() 
+ 
+screen = pygame.display.set_mode((1280, 780), pygame.RESIZABLE) 
+pygame.display.set_caption("Mecanum Robot - PID, Encoder & Ultrasonic Diagnostic Dashboard") 
+ 
+font_h1    = pygame.font.SysFont("Segoe UI", 25, bold=True) 
+font_h2    = pygame.font.SysFont("Segoe UI", 19, bold=True) 
+font_body  = pygame.font.SysFont("Consolas", 17, bold=True) 
+font_small = pygame.font.SysFont("Consolas", 14, bold=True) 
+ 
+MAX_PWM = 220 
+DEADZONE = 0.12 
+pid_enable = 0 
+prev_y_btn = False 
+ 
 rx_pid_mode = 0
 rx_vx, rx_vy, rx_omega = 0, 0, 0
 rx_target = [0, 0, 0, 0]
