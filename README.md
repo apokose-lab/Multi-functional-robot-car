@@ -5,3 +5,5 @@ Team Members: Vitalii Nazarenko, Abdulah Köse
 Technical Collaborator: Khoa Dang
 
 The readme file will be updated as developments occur...
+
+![System architecture](./Flowcharts/system_architecture.drawio.svg)
