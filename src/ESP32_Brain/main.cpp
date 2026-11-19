@@ -1,148 +1,109 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
-#include <RobotProtocol.h>
-#include <Ultrasonic.h>
 #include <MecanumKinematics.h>
 
-// Wi-Fi Access Point (AP) credentials and UDP port for communication with the Laptop Dashboard
-const char* AP_SSID = "Mecanum_Robot";
-const char* AP_PASS = "12345678";
-const uint16_t UDP_PORT = 4210;
-
-// UART pins connected to GP16/GP17 of Motion 2350 Pro (GPIO 16, 17 on ESP32-S3 are reserved for LiDAR)
-const int UART_RX_PIN = 44;
-const int UART_TX_PIN = 43;
-
-// Peripheral & module instances
-WiFiUDP udp;
-HardwareSerial MotionSerial(1);
-UltrasonicArray ultrasonic;
-MecanumKinematics kinematics;
-PacketParser<MotionFeedbackPacket, 0xBB, 0x66> feedbackParser;
-
-// Latest motion command state received from the Laptop via UDP
-int16_t vx = 0, vy = 0, omega = 0;
-uint8_t buzzer = 0, pidEnable = 0, testWheel = 0;
-unsigned long lastInputTime = 0;
-
-// Remote client network address for returning UDP telemetry packets
-IPAddress laptopIP;
-uint16_t laptopPort = 0;
-bool hasWifiClient = false;
-
-// Latest feedback data received from the Motion 2350 Pro driver board
-MotionFeedbackPacket latestMotionFB;
-unsigned long lastMotionFBTime = 0;
-
 /**
- * @brief Initializes UART communication with Motion 2350 Pro, 3x HC-SR04 ultrasonic sensors,
- *        and the Wi-Fi SoftAP + UDP server for wireless control and telemetry.
+ * @file src/ESP32_Brain/main.cpp
+ * @brief High-level robot brain running on the DFRobot FireBeetle 2 ESP32-S3.
+ *
+ * =============================================================================
+ * TEAM QUICK-START GUIDE: HOW TO CONTROL THE ROBOT IN ONE FUNCTION CALL
+ * =============================================================================
+ * All drivetrain commands take speed/rotation values in the range [-255 .. +255]
+ * and automatically enable closed-loop PID so all 4 wheels stay synchronized.
+ *
+ * Sign Conventions:
+ *   - vx    (-255..255) : +Forward,            -Backward
+ *   - vy    (-255..255) : +Strafe Left,        -Strafe Right
+ *   - omega (-255..255) : +Rotate Left (CCW),  -Rotate Right (CW)
+ *   - angleDeg          : 0 = Forward, 90 = Left, 180 = Backward, -90 = Right
+ *
+ * -----------------------------------------------------------------------------
+ * A. CONTINUOUS MOVEMENT (Best inside `loop()` for line following / sensors)
+ *    Note: Keep calling `robot.update()` in `loop()` so UART packets stream at 50Hz.
+ * -----------------------------------------------------------------------------
+ *   robot.drive(vx, vy, omega);          // Move in any (vx, vy) + spin (omega)
+ *   robot.moveAngle(45, 140, 0);         // Move diagonally Forward-Left at 140 PWM
+ *   robot.moveForward(150);              // Go straight forward at 150 PWM
+ *   robot.moveForward(150, -30);         // Curve right while moving forward
+ *   robot.moveBackward(150);             // Go straight backward at 150 PWM
+ *   robot.strafeLeft(150);               // Slide sideways left at 150 PWM
+ *   robot.strafeRight(150);              // Slide sideways right at 150 PWM
+ *   robot.rotate(120);                   // Spin in place Left (CCW); use -120 for Right (CW)
+ *   robot.stop();                        // Stop all 4 wheels immediately
+ *   robot.beep();                        // Sound a short beep on the driver board
+ *
+ * -----------------------------------------------------------------------------
+ * B. DISTANCE, ANGLE & TIMED MOVEMENT (Auto-stops when finished)
+ *    Last argument `blocking`:
+ *      - `true`  = Function waits until the maneuver finishes before moving to the next line.
+ *      - `false` = Function returns immediately so you can read sensors while moving;
+ *                  check `robot.isBusy()` and keep calling `robot.update()` in `loop()`.
+ * -----------------------------------------------------------------------------
+ *   robot.moveDistance(150, 0, 50.0f, 0, true);        // Move forward 50 cm at vx=150, then stop
+ *   robot.moveAngleDistance(90, 140, 30.0f, 0, true);  // Strafe Left (90 deg) for 30 cm, then stop
+ *   robot.rotateAngle(120, 90.0f, true);               // Turn Left 90 deg at omega=120, then stop
+ *   robot.rotateAngle(-120, 90.0f, true);              // Turn Right 90 deg at omega=-120, then stop
+ *   robot.driveFor(120, 0, 40, 1500, true);            // Curve for 1500 ms, then stop
+ *
+ * -----------------------------------------------------------------------------
+ * C. OPTIONAL SETTINGS & FEEDBACK
+ * -----------------------------------------------------------------------------
+ *   robot.setPidEnabled(true);           // true = Closed-loop PID (default), false = Raw PWM
+ *   robot.isBusy();                      // true while a non-blocking timed/distance move runs
+ *   robot.isDriverAlive();               // true if Motion 2350 Pro is replying over UART
+ * =============================================================================
  */
+
+// UART1 pins wired to Cytron Motion 2350 Pro (GP16/GP17)
+// Note: GPIO 16 and GPIO 17 on ESP32-S3 are reserved for the LiDAR sensor.
+constexpr int UART_RX_PIN = 44; // Connects to GP16 (TX) on Motion 2350 Pro
+constexpr int UART_TX_PIN = 43; // Connects to GP17 (RX) on Motion 2350 Pro
+
+HardwareSerial MotionSerial(1);
+Drivetrain robot; // High-level Mecanum drivetrain controller
+
 void setup() {
-    // Release default UART0 pins (GPIO 43, 44) so they can be used cleanly by MotionSerial (UART1)
+    // Release default UART0 from GPIO 43/44 so MotionSerial (UART1) can use them cleanly
     Serial.end();
 
-    // Configure high-speed UART1 link to the Motion 2350 Pro motor controller
+    // Initialize high-speed UART link to the Motion 2350 Pro motor driver board
     MotionSerial.setRxBufferSize(512);
     MotionSerial.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
-    // Initialize Trigger/Echo pins and hardware interrupts for the 3 ultrasonic sensors
-    ultrasonic.begin();
-
-    // Start low-latency Wi-Fi Access Point and begin listening for UDP packets
-    WiFi.persistent(false);
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS, 6, 0, 2);
-    WiFi.setSleep(false); // Disable Wi-Fi modem sleep to minimize UDP packet latency
-    WiFi.setTxPower(WIFI_POWER_15dBm);
-    udp.begin(UDP_PORT);
-
-    // Zero-initialize feedback structure before entering main loop
-    memset(&latestMotionFB, 0, sizeof(latestMotionFB));
+    // Initialize drivetrain (PID mode enabled by default)
+    robot.begin(MotionSerial);
 }
 
-/**
- * @brief Main non-blocking coordination loop running on the ESP32-S3 Brain:
- *        1. Receives gamepad commands over Wi-Fi UDP (with a 300ms safety watchdog)
- *        2. Triggers the 3 ultrasonic sensors sequentially every 35ms
- *        3. Parses incoming UART feedback packets from Motion 2350 Pro
- *        4. Computes Mecanum wheel targets and sends UART control packets every 20ms (50Hz)
- *        5. Broadcasts full diagnostic telemetry back to the Laptop over UDP every 50ms (20Hz)
- */
 void loop() {
-    // 1. Receive gamepad control packet from Laptop over Wi-Fi UDP
-    int packetSize = udp.parsePacket();
-    if (packetSize == sizeof(JoyPacket)) {
-        // Record client IP and port so telemetry can be sent back to the Laptop
-        laptopIP = udp.remoteIP();
-        laptopPort = udp.remotePort();
-        hasWifiClient = true;
+    // Always keep this non-blocking update running on every loop iteration:
+    // Streams 50Hz motor commands, handles auto-stop timers, and reads encoder feedback.
+    robot.update();
 
-        // Read binary JoyPacket payload and update active velocity/mode commands
-        JoyPacket joy;
-        udp.read(reinterpret_cast<uint8_t*>(&joy), sizeof(JoyPacket));
-        vx = joy.vx; vy = joy.vy; omega = joy.omega;
-        buzzer = joy.buzzer; pidEnable = joy.pid_enable; testWheel = joy.test_wheel;
-        lastInputTime = millis();
-    } else if (packetSize > 0) {
-        // Discard malformed UDP packets of unexpected size
-        udp.flush();
+    // -------------------------------------------------------------------------
+    // EXAMPLE 1 (Commented out): One-time autonomous sequence using blocking calls
+    // -------------------------------------------------------------------------
+    /*
+    static bool sequenceDone = false;
+    if (!sequenceDone) {
+        delay(1000);                                         // Wait 1s for motor driver boot chime
+        robot.moveDistance(140, 0, 50.0f, 0, true);          // Move forward 50 cm at PWM=140, omega=0
+        robot.rotateAngle(-120, 90.0f, true);                // Rotate 90 deg Clockwise (Right)
+        robot.moveAngleDistance(90.0f, 140, 30.0f, 0, true); // Strafe Left 30 cm
+        robot.beep();                                        // Confirm completion
+        sequenceDone = true;
     }
+    */
 
-    // Safety watchdog: stop all motion if no UDP packet arrives within 300ms
-    if (millis() - lastInputTime > 300) {
-        vx = 0; vy = 0; omega = 0; buzzer = 0; testWheel = 0;
+    // -------------------------------------------------------------------------
+    // EXAMPLE 2 (Commented out): Continuous driving with your own sensor logic
+    // -------------------------------------------------------------------------
+    /*
+    // Read your sensors here...
+    bool shouldStop = false;
+    if (shouldStop) {
+        robot.stop();
+    } else {
+        robot.drive(130, 0, 0); // Cruise forward continuously at vx=130, vy=0, omega=0
     }
-
-    // 2. Trigger the 3 HC-SR04 ultrasonic sensors in a round-robin cycle every 35ms
-    ultrasonic.update(35);
-
-    // 3. Read and validate incoming feedback packets from Motion 2350 Pro over UART
-    while (feedbackParser.readFrom(MotionSerial, latestMotionFB)) {
-        lastMotionFBTime = millis();
-    }
-
-    // 4. Compute wheel targets and transmit ControlPacket to Motion 2350 Pro every 20ms (50Hz)
-    static unsigned long lastSend = 0;
-    if (millis() - lastSend >= 20) {
-        lastSend = millis();
-        ControlPacket pkt = kinematics.buildControlPacket(vx, vy, omega, pidEnable, testWheel, buzzer);
-        sendPacket(MotionSerial, pkt);
-        buzzer = 0; // Clear one-shot buzzer trigger flag after sending
-    }
-
-    // 5. Transmit wireless diagnostic telemetry packet to Laptop every 50ms (20Hz)
-    static unsigned long lastTele = 0;
-    unsigned long now = millis();
-    if (hasWifiClient && (now - lastTele >= 50)) {
-        lastTele = now;
-
-        WifiTelemetryPacket tele;
-        tele.pid_mode = pidEnable;
-        tele.vx = vx; tele.vy = vy; tele.omega = omega;
-
-        // Check if Motion 2350 Pro has sent a valid UART feedback packet within the last 400ms
-        bool motionAlive = (now - lastMotionFBTime < 400);
-        tele.motion_alive = motionAlive ? 1 : 0;
-
-        // Populate wheel setpoints and actual motor/encoder measurements
-        for (int i = 0; i < 4; i++) {
-            tele.target_val[i] = kinematics.getTarget(i);
-            tele.actual_pwm[i] = motionAlive ? latestMotionFB.actual_pwm[i] : 0;
-            tele.actual_rpm[i] = motionAlive ? latestMotionFB.actual_rpm[i] : 0;
-            tele.enc_health[i] = motionAlive ? latestMotionFB.enc_health[i] : 0;
-        }
-        tele.active_gpios = motionAlive ? latestMotionFB.active_gpios : 0;
-
-        // Populate ultrasonic distances and sensor connection status bitmask
-        ultrasonic.readTelemetry(tele.us_cm, tele.us_status, 350);
-        tele.uptime_ms = now;
-        tele.checksum  = calculateChecksum(tele);
-
-        // Send binary telemetry packet over Wi-Fi UDP to the Laptop
-        udp.beginPacket(laptopIP, laptopPort);
-        udp.write(reinterpret_cast<const uint8_t*>(&tele), sizeof(WifiTelemetryPacket));
-        udp.endPacket();
-    }
+    */
 }

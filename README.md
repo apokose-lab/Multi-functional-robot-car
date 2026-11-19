@@ -6,4 +6,7 @@ Technical Collaborator: Khoa Dang
 
 The readme file will be updated as developments occur...
 
+## Documentation
+- **[Mecanum Drivetrain Developer Guide (English)](./DRIVETRAIN_GUIDE.md)** — Complete API reference, coordinate conventions, PID control explanation, and code examples for controlling the Mecanum robot car.
+
 ![System architecture](./Flowcharts/system_architecture.drawio.svg)
