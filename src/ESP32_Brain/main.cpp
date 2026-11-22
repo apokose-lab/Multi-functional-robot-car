@@ -1,5 +1,9 @@
 #include <Arduino.h>
 #include <MecanumKinematics.h>
+#include <LidarC1Protocol.h>
+#include <LidarSectors.h>
+#include <Ultrasonic.h>
+#include <ObstacleAvoidance.h>
 
 /**
  * @file src/ESP32_Brain/main.cpp
@@ -59,26 +63,384 @@
 constexpr int UART_RX_PIN = 44; // Connects to GP16 (TX) on Motion 2350 Pro
 constexpr int UART_TX_PIN = 43; // Connects to GP17 (RX) on Motion 2350 Pro
 
+constexpr int LIDAR_RX_PIN = 17;
+constexpr int LIDAR_TX_PIN = 16;
+
 HardwareSerial MotionSerial(1);
+HardwareSerial LidarSerial(2);
 Drivetrain robot; // High-level Mecanum drivetrain controller
+
+struct UltrasonicPins
+{
+    int trigger;
+    int echo;
+
+    constexpr bool assigned() const
+    {
+        return trigger >= 0 && echo >= 0 && trigger != echo;
+    }
+};
+
+// TRIG, ECHO. Pair {8, 10} was traced on one connector; confirm its mounted position.
+constexpr UltrasonicPins FRONT_US_PINS{-1, -1};
+constexpr UltrasonicPins LEFT_US_PINS{4, 5};
+constexpr UltrasonicPins RIGHT_US_PINS{-1, -1};
+
+constexpr bool usesSerialPin(int pin)
+{
+    return pin == UART_RX_PIN || pin == UART_TX_PIN ||
+           pin == LIDAR_RX_PIN || pin == LIDAR_TX_PIN ||
+           pin == 19 || pin == 20; // ESP32-S3 native USB
+}
+
+constexpr bool separatePins(UltrasonicPins first, UltrasonicPins second)
+{
+    return !first.assigned() || !second.assigned() ||
+           (first.trigger != second.trigger && first.trigger != second.echo &&
+            first.echo != second.trigger && first.echo != second.echo);
+}
+
+constexpr bool freePins(UltrasonicPins pins)
+{
+    return !pins.assigned() || (!usesSerialPin(pins.trigger) && !usesSerialPin(pins.echo));
+}
+
+static_assert(freePins(FRONT_US_PINS) && freePins(LEFT_US_PINS) && freePins(RIGHT_US_PINS),
+              "Ultrasonic pins must not overlap with LiDAR, motion UART or USB");
+static_assert(separatePins(FRONT_US_PINS, LEFT_US_PINS) &&
+              separatePins(FRONT_US_PINS, RIGHT_US_PINS) &&
+              separatePins(LEFT_US_PINS, RIGHT_US_PINS),
+              "Ultrasonic channels must use separate pins");
+
+// Millimetres. Replace the provisional envelope and mounts with measured values.
+constexpr LidarChassisGeometry CHASSIS{250.0f, 200.0f, 30.0f, 0.0f, 0.0f, 0.0f};
+constexpr float FRONT_US_FROM_CENTER_MM = 120.0f;
+constexpr float LEFT_US_FROM_CENTER_MM = 92.0f;
+constexpr float RIGHT_US_FROM_CENTER_MM = 92.0f;
+
+DirectionReadings lidarReadings{};
+DirectionReadings ultrasonicReadings{};
+
+struct UltrasonicChannel
+{
+    UltrasonicChannel(const char* label, UltrasonicPins pins, float insetMm,
+                      DistanceReading& reading)
+        : label(label),
+          enabled(pins.assigned()),
+          sensor(static_cast<std::uint8_t>(pins.trigger), static_cast<std::uint8_t>(pins.echo)),
+          insetMm(insetMm),
+          reading(reading)
+    {
+    }
+
+    const char* label;
+    bool enabled;
+    Ultrasonic sensor;
+    float insetMm;
+    DistanceReading& reading;
+};
+
+UltrasonicChannel ultrasonicChannels[] = {
+    {"front", FRONT_US_PINS, CHASSIS.lengthMm / 2.0f - FRONT_US_FROM_CENTER_MM, ultrasonicReadings.front},
+    {"left", LEFT_US_PINS, CHASSIS.widthMm / 2.0f - LEFT_US_FROM_CENTER_MM, ultrasonicReadings.left},
+    {"right", RIGHT_US_PINS, CHASSIS.widthMm / 2.0f - RIGHT_US_FROM_CENTER_MM, ultrasonicReadings.right}
+};
+
+AvoidanceController avoidance;
+bool avoidanceArmed = false;
+
+enum class LidarMode
+{
+    Idle,
+    WaitingForHealth,
+    Scanning,
+    Stopping
+};
+
+void updateLidar(int key)
+{
+    static HealthReplyReceiver healthReceiver;
+    static ScanReceiver scanReceiver;
+    static LidarSectorAccumulator sectors{CHASSIS};
+    static LidarMode mode = LidarMode::Idle;
+    static unsigned long modeStartedAt = 0;
+    static unsigned long lastPrintAt = 0;
+    const unsigned long now = millis();
+
+    for (int queued = LidarSerial.available(); queued > 0; --queued)
+    {
+        const int received = LidarSerial.read();
+        if (received < 0)
+        {
+            break;
+        }
+
+        const auto byte = static_cast<std::uint8_t>(received);
+        if (mode == LidarMode::WaitingForHealth)
+        {
+            HealthReply reply{};
+            if (healthReceiver.push(byte, reply))
+            {
+                mode = LidarMode::Idle;
+                Serial.printf("GET_HEALTH status=%u error=%u\n",
+                              static_cast<unsigned>(reply.status),
+                              static_cast<unsigned>(reply.errorCode));
+            }
+        }
+        else if (mode == LidarMode::Scanning)
+        {
+            ScanPoint point{};
+            LidarSectors completed{};
+
+            if (scanReceiver.push(byte, point) && sectors.push(point, completed))
+            {
+                lidarReadings = {
+                    {completed.frontMm, now},
+                    {completed.leftMm, now},
+                    {completed.rightMm, now}
+                };
+
+                if (now - lastPrintAt >= 250)
+                {
+                    lastPrintAt = now;
+                    Serial.printf("SCAN clearance front=%.0f left=%.0f right=%.0f mm\n",
+                                  static_cast<double>(completed.frontMm),
+                                  static_cast<double>(completed.leftMm),
+                                  static_cast<double>(completed.rightMm));
+                }
+            }
+        }
+    }
+
+    if (mode == LidarMode::WaitingForHealth && now - modeStartedAt >= 500)
+    {
+        mode = LidarMode::Idle;
+        Serial.println("GET_HEALTH timeout");
+    }
+    else if (mode == LidarMode::Stopping && now - modeStartedAt >= 20)
+    {
+        mode = LidarMode::Idle;
+    }
+
+    if (mode == LidarMode::Idle && key == 'h')
+    {
+        constexpr std::uint8_t command[] = {0xA5, 0x52};
+        healthReceiver = HealthReplyReceiver{};
+        LidarSerial.write(command, sizeof(command));
+        modeStartedAt = millis();
+        mode = LidarMode::WaitingForHealth;
+        Serial.println("GET_HEALTH sent");
+    }
+    else if (mode == LidarMode::Idle && key == 's')
+    {
+        constexpr std::uint8_t command[] = {0xA5, 0x20};
+        scanReceiver = ScanReceiver{};
+        sectors = LidarSectorAccumulator{CHASSIS};
+        lidarReadings = {};
+        LidarSerial.write(command, sizeof(command));
+        lastPrintAt = millis();
+        mode = LidarMode::Scanning;
+        Serial.println("SCAN sent");
+    }
+    else if (mode == LidarMode::Scanning && key == 'x')
+    {
+        constexpr std::uint8_t command[] = {0xA5, 0x25};
+        LidarSerial.write(command, sizeof(command));
+        modeStartedAt = millis();
+        mode = LidarMode::Stopping;
+        lidarReadings = {};
+        Serial.println("STOP sent");
+    }
+}
+
+void updateUltrasonics()
+{
+    constexpr unsigned long pingIntervalMs = 70;
+    constexpr std::size_t channelCount = sizeof(ultrasonicChannels) / sizeof(ultrasonicChannels[0]);
+    static std::size_t nextChannel = 0;
+    static unsigned long lastPingAt = 0;
+    const unsigned long now = millis();
+    if (now - lastPingAt < pingIntervalMs)
+    {
+        return;
+    }
+
+    for (std::size_t checked = 0; checked < channelCount; ++checked)
+    {
+        auto& channel = ultrasonicChannels[nextChannel];
+        nextChannel = (nextChannel + 1) % channelCount;
+        if (!channel.enabled)
+        {
+            continue;
+        }
+
+        lastPingAt = now;
+        const float distanceCm = channel.sensor.readDistanceCm();
+        float clearanceMm = -1.0f;
+        if (distanceCm > 0.0f)
+        {
+            const float gap = distanceCm * 10.0f - channel.insetMm;
+            clearanceMm = gap > 0.0f ? gap : 0.0f;
+        }
+        channel.reading = {clearanceMm, millis()};
+
+        if (channel.reading.mm >= 0.0f)
+        {
+            Serial.printf("US %s=%.0f mm\n", channel.label, static_cast<double>(channel.reading.mm));
+        }
+        else
+        {
+            Serial.printf("US %s=unknown\n", channel.label);
+        }
+        return;
+    }
+}
+
+void reportFrontPath(FrontPath path)
+{
+    static bool printed = false;
+    static FrontPath previous = FrontPath::Unknown;
+
+    if (printed && path == previous)
+    {
+        return;
+    }
+
+    printed = true;
+    previous = path;
+
+    switch (path)
+    {
+        case FrontPath::Blocked:
+            Serial.println("FRONT blocked");
+            break;
+        case FrontPath::Clear:
+            Serial.println("FRONT clear");
+            break;
+        case FrontPath::Unknown:
+            Serial.println("FRONT unknown");
+            break;
+    }
+}
+
+void applyMotion(MotionAction action)
+{
+    constexpr std::int16_t driveCommand = 65;
+    static MotionAction previous = MotionAction::Stop;
+    if (action == previous)
+    {
+        return;
+    }
+    previous = action;
+
+    switch (action)
+    {
+        case MotionAction::Forward:
+            robot.drive(driveCommand, 0);
+            Serial.println("AUTO forward");
+            break;
+        case MotionAction::ShiftLeft:
+            robot.drive(0, driveCommand);
+            Serial.println("AUTO left");
+            break;
+        case MotionAction::ShiftRight:
+            robot.drive(0, -driveCommand);
+            Serial.println("AUTO right");
+            break;
+        case MotionAction::Stop:
+            robot.stop();
+            Serial.println("AUTO stop");
+            break;
+    }
+}
+
+void disarmAvoidance()
+{
+    applyMotion(MotionAction::Stop);
+    if (avoidanceArmed)
+    {
+        avoidanceArmed = false;
+        Serial.println("AUTO disarmed");
+    }
+}
+
+void updateAvoidance(int key)
+{
+    const unsigned long now = millis();
+    const FrontPath front = evaluateFrontPath(lidarReadings.front, ultrasonicReadings.front, now);
+    reportFrontPath(front);
+    const bool frontReady = isUsableDistance(lidarReadings.front, now) &&
+                            isUsableDistance(ultrasonicReadings.front, now);
+
+    if (key == 'a' && !avoidanceArmed)
+    {
+        if (!FRONT_US_PINS.assigned() || !LEFT_US_PINS.assigned() || !RIGHT_US_PINS.assigned())
+        {
+            Serial.println("AUTO unavailable: configure all ultrasonic pins");
+            return;
+        }
+        if (!frontReady || !robot.isDriverAlive(250))
+        {
+            Serial.println("AUTO unavailable: check front sensors and motor driver");
+            return;
+        }
+
+        avoidance = AvoidanceController{};
+        avoidanceArmed = true;
+        Serial.println("AUTO armed");
+    }
+
+    if (!avoidanceArmed)
+    {
+        return;
+    }
+    if (!robot.isDriverAlive(250))
+    {
+        disarmAvoidance();
+        Serial.println("AUTO lost motor feedback");
+        return;
+    }
+
+    const FrontPath motionPath = frontReady ? front : FrontPath::Unknown;
+    applyMotion(avoidance.update(motionPath, lidarReadings, ultrasonicReadings, now));
+}
 
 void setup() {
     // Release default UART0 from GPIO 43/44 so MotionSerial (UART1) can use them cleanly
-    Serial.end();
-
+    Serial0.end();
+    Serial.begin(115200);
     // Initialize high-speed UART link to the Motion 2350 Pro motor driver board
     MotionSerial.setRxBufferSize(512);
     MotionSerial.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+
+    // Initialize LiDAR
+    LidarSerial.setRxBufferSize(2048);
+    LidarSerial.begin(460800, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
+    for (auto& channel : ultrasonicChannels)
+    {
+        if (channel.enabled)
+        {
+            channel.sensor.begin();
+        }
+    }
 
     // Initialize drivetrain (PID mode enabled by default)
     robot.begin(MotionSerial);
 }
 
 void loop() {
+    const int key = Serial.read();
+    if (key == 'd' || key == 'x')
+    {
+        disarmAvoidance();
+    }
+
     // Always keep this non-blocking update running on every loop iteration:
     // Streams 50Hz motor commands, handles auto-stop timers, and reads encoder feedback.
     robot.update();
-
+    updateLidar(key);
+    updateUltrasonics();
+    updateAvoidance(key);
     // -------------------------------------------------------------------------
     // EXAMPLE 1 (Commented out): One-time autonomous sequence using blocking calls
     // -------------------------------------------------------------------------
