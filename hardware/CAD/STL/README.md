@@ -13,7 +13,7 @@ The models represent custom mounting components and mechanical parts developed t
 | `LiDAR mount.stl` | Mounting structure for the RPLIDAR C1 |
 | `Motion Pro Mount.stl` | Mounting bracket for the Motion 2350 Pro controller |
 | `Motor mount.stl` | Mounting component for the DC motors |
-| `Robotic arm mount.stl` | Mounting structure for the 3-DOF robotic arm |
+| `Robotic arm mount.stl` | Mounting structure for the 4-DOF robotic arm |
 | `Servo horn mount.stl` | Mechanical adapter for servo horn attachment |
 | `ULTRASONIC SENSOR MOUNT (1).stl` | Mounting component for ultrasonic sensors |
 | `US Mount.stl` | Additional ultrasonic sensor mounting component |
