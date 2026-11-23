@@ -59,11 +59,11 @@
  */
 
 // UART1 pins wired to Cytron Motion 2350 Pro (GP16/GP17)
-// Note: GPIO 16 and GPIO 17 on ESP32-S3 are reserved for the LiDAR sensor.
+// Note: GPIO 16 and GPIO 15 on ESP32-S3 are reserved for the LiDAR sensor.
 constexpr int UART_RX_PIN = 44; // Connects to GP16 (TX) on Motion 2350 Pro
 constexpr int UART_TX_PIN = 43; // Connects to GP17 (RX) on Motion 2350 Pro
 
-constexpr int LIDAR_RX_PIN = 17;
+constexpr int LIDAR_RX_PIN = 15;
 constexpr int LIDAR_TX_PIN = 16;
 
 HardwareSerial MotionSerial(1);
